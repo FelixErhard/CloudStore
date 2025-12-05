@@ -1,0 +1,189 @@
+name: Monorepo CI/CD
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+    types: [closed]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ------------------------------------------------------------------
+  # SCHRITT 1: Änderungen erkennen
+  # ------------------------------------------------------------------
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      # Wir exportieren die Ergebnisse für die nächsten Jobs
+      api: ${{ steps.filter.outputs.api }}
+      worker: ${{ steps.filter.outputs.worker }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: dorny/paths-filter@v2
+        id: filter
+        with:
+          filters: |
+            api:
+              - 'services/api/**'
+              - 'services/common/**' # Wenn sich common ändert, muss API auch getestet werden
+            worker:
+              - 'services/worker/**'
+              - 'services/common/**'
+            frontend:
+              - 'services/frontend/**'
+
+  # ------------------------------------------------------------------
+  # SCHRITT 2: Matrix dynamisch bauen
+  # ------------------------------------------------------------------
+  build-matrix:
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          # Wir bauen hier manuell ein JSON Array zusammen, basierend auf den Änderungen.
+          # Dies ist ein Bash-Skript.
+          
+          MATRIX_JSON="{\"include\":["
+          
+          # Prüfen ob API geändert wurde
+          if [ "${{ needs.detect-changes.outputs.api }}" == 'true' ]; then
+            MATRIX_JSON="$MATRIX_JSON{\"service\":\"api\",\"path\":\"services/api\",\"type\":\"python\"},"
+          fi
+          
+          # Prüfen ob Worker geändert wurde
+          if [ "${{ needs.detect-changes.outputs.worker }}" == 'true' ]; then
+            MATRIX_JSON="$MATRIX_JSON{\"service\":\"worker\",\"path\":\"services/worker\",\"type\":\"python\"},"
+          fi
+
+          # Prüfen ob Frontend geändert wurde
+          if [ "${{ needs.detect-changes.outputs.frontend }}" == 'true' ]; then
+            MATRIX_JSON="$MATRIX_JSON{\"service\":\"frontend\",\"path\":\"services/frontend\",\"type\":\"node\"},"
+          fi
+          
+          # Das letzte Komma entfernen und JSON schließen
+          MATRIX_JSON="${MATRIX_JSON%,}]}"
+          
+          # Wenn nichts geändert wurde, erzeugen wir eine leere Liste (vermeidet Fehler)
+          if [ "$MATRIX_JSON" == "{\"include\":]}" ]; then
+             echo "matrix={\"include\":[]}" >> $GITHUB_OUTPUT
+          else
+             echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+          fi
+
+  # ------------------------------------------------------------------
+  # SCHRITT 3: Testen & Bauen (Parallel)
+  # ------------------------------------------------------------------
+  test-and-build:
+    needs: build-matrix
+    # Dieser Job läuft nur, wenn die Matrix nicht leer ist
+    if: ${{ fromJson(needs.build-matrix.outputs.matrix).include[0] }}
+    runs-on: ubuntu-latest
+    
+    strategy:
+      fail-fast: false # Wenn ein Service fehlschlägt, sollen die anderen weiterlaufen
+      matrix: ${{ fromJson(needs.build-matrix.outputs.matrix) }}
+
+    name: ${{ matrix.service }} (${{ matrix.type }})
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # --- SETUP: PYTHON (Nur wenn type == python) ---
+      - name: Set up Python
+        if: matrix.type == 'python'
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          cache: 'pip'
+
+      - name: Install Python Dependencies
+        if: matrix.type == 'python'
+        run: |
+          cd ${{ matrix.path }}
+          pip install -r requirements.txt
+          pip install pytest httpx pytest-asyncio ruff
+
+      # --- SETUP: NODE (Nur wenn type == node) ---
+      - name: Set up Node
+        if: matrix.type == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: ${{ matrix.path }}/package-lock.json
+
+      - name: Install Node Dependencies
+        if: matrix.type == 'node'
+        run: |
+          cd ${{ matrix.path }}
+          npm ci
+
+      # --- PLACEHOLDER: UNIT TESTS ---
+      - name: Run Unit Tests
+        run: |
+          echo "Running Unit Tests for ${{ matrix.service }}..."
+          cd ${{ matrix.path }}
+          
+          if [ "${{ matrix.type }}" == "python" ]; then
+            # Dein Python Test Befehl (z.B. pytest tests/unit)
+            echo "PLACEHOLDER: pytest unit"
+            # pytest tests/unit  <-- Später einkommentieren
+          elif [ "${{ matrix.type }}" == "node" ]; then
+            # Dein Node Test Befehl
+            echo "PLACEHOLDER: npm run test:unit"
+          fi
+
+      # --- PLACEHOLDER: INTEGRATION TESTS ---
+      - name: Run Integration Tests
+        run: |
+          echo "Running Integration Tests for ${{ matrix.service }}..."
+          cd ${{ matrix.path }}
+          
+          if [ "${{ matrix.type }}" == "python" ]; then
+             echo "PLACEHOLDER: pytest integration"
+          elif [ "${{ matrix.type }}" == "node" ]; then
+             echo "PLACEHOLDER: npm run test:integration"
+          fi
+
+      # --- DOCKER BUILD & PUSH ---
+      # Läuft nur, wenn die Tests oben nicht fehlgeschlagen sind.
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # Der Image-Name hängt vom Service ab!
+          images: ghcr.io/${{ github.repository }}/${{ matrix.service }}
+          tags: |
+            type=ref,event=branch
+            type=sha,format=long
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.path }}
+          file: ${{ matrix.path }}/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
