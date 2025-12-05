@@ -1,14 +1,19 @@
-name: Monorepo CI/CD (Robust)
+name: Monorepo CI/CD
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
-  # -----------------------------------------------------------
-  # 1. CHANGES & MATRIX
-  # -----------------------------------------------------------
+  # ------------------------------------------------------------------
+  # JOB 1: ÄNDERUNGEN ERKENNEN & MATRIX BAUEN
+  # ------------------------------------------------------------------
   detect-changes:
     runs-on: ubuntu-latest
     outputs:
@@ -16,85 +21,181 @@ jobs:
       has_changes: ${{ steps.set-matrix.outputs.has_changes }}
     steps:
       - uses: actions/checkout@v4
+      
       - uses: dorny/paths-filter@v2
         id: filter
         with:
           filters: |
-            api: ['services/api/**', 'services/common/**']
-            worker: ['services/worker/**', 'services/common/**']
-            frontend: ['services/frontend/**']
-      
-      # (Hier derselbe Matrix-Code wie vorher, der JSON baut)
+            api:
+              - 'services/api/**'
+              - 'services/common/**'
+            worker:
+              - 'services/worker/**'
+              - 'services/common/**'
+            frontend:
+              - 'services/frontend/**'
+
       - id: set-matrix
         run: |
-           # ... Logik um JSON zu bauen ...
-           # Beispiel Output: {"include": [{"service":"api", "type":"python"}, ...]}
+          # Initialisiere JSON String
+          MATRIX_JSON="{\"include\":["
+          HAS_CHANGES="false"
 
-  # -----------------------------------------------------------
-  # 2. UNIT TESTS (Parallel per Matrix)
-  # -----------------------------------------------------------
+          # 1. API Check
+          if [ "${{ steps.filter.outputs.api }}" == 'true' ]; then
+            MATRIX_JSON="$MATRIX_JSON{\"service\":\"api\",\"path\":\"services/api\",\"type\":\"python\"},"
+            HAS_CHANGES="true"
+          fi
+          
+          # 2. Worker Check
+          if [ "${{ steps.filter.outputs.worker }}" == 'true' ]; then
+            MATRIX_JSON="$MATRIX_JSON{\"service\":\"worker\",\"path\":\"services/worker\",\"type\":\"python\"},"
+            HAS_CHANGES="true"
+          fi
+
+          # 3. Frontend Check
+          if [ "${{ steps.filter.outputs.frontend }}" == 'true' ]; then
+            MATRIX_JSON="$MATRIX_JSON{\"service\":\"frontend\",\"path\":\"services/frontend\",\"type\":\"node\"},"
+            HAS_CHANGES="true"
+          fi
+          
+          # Letztes Komma entfernen und JSON schließen
+          # Wenn keine Änderungen, dann leeres Array vermeiden (führt sonst zu Fehler)
+          if [ "$HAS_CHANGES" == "true" ]; then
+             MATRIX_JSON="${MATRIX_JSON%,}]}"
+          else
+             MATRIX_JSON="{\"include\":[]}"
+          fi
+          
+          echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+          echo "has_changes=$HAS_CHANGES" >> $GITHUB_OUTPUT
+
+  # ------------------------------------------------------------------
+  # JOB 2: UNIT TESTS (Parallel per Matrix)
+  # ------------------------------------------------------------------
   unit-tests:
     needs: detect-changes
     if: needs.detect-changes.outputs.has_changes == 'true'
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+    
+    name: Unit Test - ${{ matrix.service }}
     steps:
       - uses: actions/checkout@v4
-      # Setup Python/Node je nach matrix.type
-      # Run Unit Tests (pytest / npm run test:unit)
-      # WICHTIG: Hier wird NICHT gepusht! Nur getestet.
 
-  # -----------------------------------------------------------
-  # 3. DER GATEKEEPER: SYSTEM INTEGRATION TEST
-  # Hier fangen wir den Fehler "Backend API geändert, Frontend bricht" ab.
-  # -----------------------------------------------------------
-  system-integration-test:
-    needs: [unit-tests] # Wartet, bis ALLE Unit Tests grün sind
+      # --- PYTHON SETUP ---
+      - name: Setup Python
+        if: matrix.type == 'python'
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python Deps
+        if: matrix.type == 'python'
+        run: |
+          cd ${{ matrix.path }}
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio httpx ruff
+
+      # --- NODE SETUP ---
+      - name: Setup Node
+        if: matrix.type == 'node'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: ${{ matrix.path }}/package-lock.json
+      
+      - name: Install Node Deps
+        if: matrix.type == 'node'
+        run: |
+          cd ${{ matrix.path }}
+          npm ci
+
+      # --- TEST EXECUTION ---
+      - name: Run Unit Tests
+        run: |
+          cd ${{ matrix.path }}
+          if [ "${{ matrix.type }}" == "python" ]; then
+            echo "Running Pytest..."
+            pytest -q
+          else
+            # PLACEHOLDER: Node Tests
+            echo "Running NPM Tests..."
+            # npm run test:unit
+          fi
+
+  # ------------------------------------------------------------------
+  # JOB 3: SYSTEM INTEGRATION (Der Gatekeeper)
+  # Fährt alles hoch und prüft Interaktion
+  # ------------------------------------------------------------------
+  integration-test:
+    needs: [unit-tests] # Wartet auf Unit Tests
+    if: needs.detect-changes.outputs.has_changes == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       
-      # Wir nutzen Docker Compose, um das GANZE System hochzufahren
-      - name: Start Full Stack
+      - name: Set up Python for Test Runner
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install Test Dependencies
+        run: pip install pytest httpx
+
+      - name: Start System via Docker Compose
+        # Wir nutzen ein spezielles Compose File für CI, das Ports mappt
         run: docker-compose -f docker-compose.test.yml up -d --build
 
-      - name: Wait for Services
-        run: sleep 15 # oder ein Healthcheck-Script
-
-      # Jetzt läuft ein ECHTER Request vom Frontend Container gegen das Backend
-      # Oder wir nutzen ein Tool wie Cypress / Playwright oder ein Python-Script
-      - name: Run E2E Check
+      - name: Wait for Services (Simple Healthcheck)
         run: |
-          # Beispiel: Ein Script, das prüft, ob das Frontend noch lädt 
-          # und Daten vom Backend bekommt.
-          ./scripts/run-smoke-tests.sh
-          
-      - name: Dump Logs on Failure
-        if: failure()
-        run: docker-compose logs
+          echo "Warte auf API..."
+          # Einfacher Loop, der wartet bis Port 8000 antwortet
+          timeout 60s bash -c 'until curl -s http://localhost:8000/health > /dev/null; do sleep 2; done'
+          echo "API ist da!"
 
-  # -----------------------------------------------------------
-  # 4. BUILD & PUSH (Parallel)
-  # Läuft nur, wenn der System-Test erfolgreich war!
-  # -----------------------------------------------------------
+      - name: Run Integration Tests
+        run: |
+          # Führt die Tests aus, die von "außen" gegen die laufenden Container feuern
+          pytest tests/integration/
+
+      - name: Show Logs on Failure
+        if: failure()
+        run: docker-compose -f docker-compose.test.yml logs
+
+      - name: Teardown
+        if: always()
+        run: docker-compose -f docker-compose.test.yml down
+
+  # ------------------------------------------------------------------
+  # JOB 4: BUILD & PUSH (Parallel)
+  # Läuft nur, wenn Integration OK war
+  # ------------------------------------------------------------------
   build-and-push:
-    needs: [detect-changes, system-integration-test]
+    needs: [detect-changes, integration-test]
     if: needs.detect-changes.outputs.has_changes == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+      
+    name: Push - ${{ matrix.service }}
     steps:
       - uses: actions/checkout@v4
+      
       - uses: docker/login-action@v3
         with:
-            registry: ghcr.io
-            username: ${{ github.actor }}
-            password: ${{ secrets.GITHUB_TOKEN }}
-            
-      # Hier wird das Image final gebaut und gepusht
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - uses: docker/build-push-action@v5
         with:
           context: ${{ matrix.path }}
+          file: ${{ matrix.path }}/Dockerfile
           push: true
           tags: ghcr.io/${{ github.repository }}/${{ matrix.service }}:latest

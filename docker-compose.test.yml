@@ -1,0 +1,9 @@
+version: '3.8'
+services:
+  api:
+    build: ./services/api
+    ports:
+      - "8000:8000"
+  worker:
+    build: ./services/worker
+    command: ["/bin/sh", "-c", "sleep 1 && echo 'Worker ready' && tail -f /dev/null"]
