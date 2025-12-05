@@ -1,6 +1,9 @@
 FROM python:3.11-slim
 WORKDIR /app
-COPY src/requirements.txt ./requirements.txt
+# Copy service requirements (located at service root)
+COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
-COPY src/ .
-CMD ["python", "app.py"]
+# Copy application sources
+COPY src/ ./src
+# Run the Flask app
+CMD ["python", "src/app.py"]

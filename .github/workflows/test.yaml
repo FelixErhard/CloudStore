@@ -146,7 +146,7 @@ jobs:
           cache: 'pip'
       
       - name: Install Test Dependencies
-        run: pip install pytest httpx
+        run: pip install pytest requests
 
       - name: Start System via Docker Compose
         # Wir nutzen ein spezielles Compose File für CI, das Ports mappt
