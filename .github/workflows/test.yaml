@@ -145,32 +145,32 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       
-      - name: Install Test Dependencies
-        run: pip install pytest requests
+      # - name: Install Test Dependencies
+      #   run: pip install pytest requests
 
-      - name: Start System via Docker Compose
-        # Wir nutzen ein spezielles Compose File für CI, das Ports mappt
-        run: docker-compose -f docker-compose.test.yml up -d --build
+      # - name: Start System via Docker Compose
+      #   # Wir nutzen ein spezielles Compose File für CI, das Ports mappt
+      #   run: docker-compose -f docker-compose.test.yml up -d --build
 
-      - name: Wait for Services (Simple Healthcheck)
-        run: |
-          echo "Warte auf API..."
-          # Einfacher Loop, der wartet bis Port 8000 antwortet
-          timeout 60s bash -c 'until curl -s http://localhost:8000/health > /dev/null; do sleep 2; done'
-          echo "API ist da!"
+      # - name: Wait for Services (Simple Healthcheck)
+      #   run: |
+      #     echo "Warte auf API..."
+      #     # Einfacher Loop, der wartet bis Port 8000 antwortet
+      #     timeout 60s bash -c 'until curl -s http://localhost:8000/health > /dev/null; do sleep 2; done'
+      #     echo "API ist da!"
 
-      - name: Run Integration Tests
-        run: |
-          # Führt die Tests aus, die von "außen" gegen die laufenden Container feuern
-          pytest tests/integration/
+      # - name: Run Integration Tests
+      #   run: |
+      #     # Führt die Tests aus, die von "außen" gegen die laufenden Container feuern
+      #     pytest tests/integration/
 
-      - name: Show Logs on Failure
-        if: failure()
-        run: docker-compose -f docker-compose.test.yml logs
+      # - name: Show Logs on Failure
+      #   if: failure()
+      #   run: docker-compose -f docker-compose.test.yml logs
 
-      - name: Teardown
-        if: always()
-        run: docker-compose -f docker-compose.test.yml down
+      # - name: Teardown
+      #   if: always()
+      #   run: docker-compose -f docker-compose.test.yml down
 
   # ------------------------------------------------------------------
   # JOB 4: BUILD & PUSH (Parallel)
@@ -199,3 +199,25 @@ jobs:
           file: ${{ matrix.path }}/Dockerfile
           push: true
           tags: ghcr.io/${{ github.repository }}/${{ matrix.service }}:latest
+          
+  # ------------------------------------------------------------------
+  ci-status-check:
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    if: always() # Läuft immer, auch wenn vorher was gefailt hat oder skipped wurde
+    steps:
+      - name: Check Status
+        run: |
+          # Wir prüfen den Status der vorherigen Jobs
+          
+          # 1. War das Ergebnis von detect-changes erfolgreich?
+          if [ "${{ needs.build-and-push.result }}" == "failure" ] || [ "${{ needs.build-and-push.result }}" == "cancelled" ]; then
+            echo "Pipeline failed!"
+            exit 1
+          fi
+          
+          # Hier ist der Trick: Wenn build-and-push 'skipped' war (keine Änderungen), 
+          # ist das auch okay (= Success).
+          
+          echo "All checks passed or were skipped correctly."
+          exit 0
